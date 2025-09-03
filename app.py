@@ -255,7 +255,7 @@ def clean_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     df["User ID"] = df["User ID"].astype(str)
     df["Server"] = df["Server"].astype(str)
     df["Algo"] = df["Algo"].astype(str)
-    df["Telegram ID(s)"] = df["Telegram ID(s)"].astype(float)
+    df["Telegram ID(s)"] = df["Telegram ID(s)"].astype(int)
 
     for c in ["Server", "Telegram ID(s)", "Algo"]:
         df[c] = df[c].fillna("")
@@ -347,7 +347,7 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
                 diffs.append("Max Loss")
         if str(a["Server"]) != str(b["Server"]):
             diffs.append("Server")
-        if str(a["Telegram ID(s)"]) != str(b["Telegram ID(s)"]):
+        if int(a["Telegram ID(s)"]) != int(b["Telegram ID(s)"]):
             diffs.append("Telegram ID(s)")
         if str(a["Algo"]) != str(b["Algo"]):
             diffs.append("Algo")
@@ -545,4 +545,5 @@ else:
             st.exception(e)
     else:
         st.info("Upload both Excel files to start.")
+
 
