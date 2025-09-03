@@ -303,7 +303,7 @@ def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
         "User ID": df[col_user].astype(str),
         "Max Loss": df[col_mloss],
         "Server": df[col_server].astype(str),
-        "Telegram ID(s)": df[col_alloc].astype(str),
+        "Telegram ID(s)": df[col_alloc].astype(int),
         "Algo": df[col_algo].astype(str),
     })
     # Reuse cleaning to align types and helper columns
@@ -545,5 +545,6 @@ else:
             st.exception(e)
     else:
         st.info("Upload both Excel files to start.")
+
 
 
