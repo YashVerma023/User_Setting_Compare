@@ -19,33 +19,7 @@ SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 TOKEN_PATH = "token.json"
 CLIENT_SECRETS_FILE = "client_secrets.json"
 
-# Updated Server -> (Operator, Algo)
-SERVER_ALGO_MAP = {
-    "VS1": {"Operator": "CHETANB", "Algo": 8},
-    "VS10": {"Operator": "VIKASA", "Algo": 1},
-    "VS11": {"Operator": "GULSHANS", "Algo": 7},
-    "VS12": {"Operator": "BANSHIP", "Algo": 1},
-    "VS13": {"Operator": "VIKASA", "Algo": 1},
-    "VS14": {"Operator": "SAHILM", "Algo": 15},
-    "VS15": {"Operator": "BANSHIP", "Algo": 1},
-    "VS16": {"Operator": "GAURAVK", "Algo": 7},
-    "VS2": {"Operator": "BANSHIP", "Algo": 1},
-    "VS3": {"Operator": "PIYUSHM", "Algo": 2},
-    "VS4": {"Operator": "ASHUTOSHM", "Algo": 102},
-    "VS5": {"Operator": "SAHILM", "Algo": 15},
-    "VS6": {"Operator": "CHETANB", "Algo": 5},
-    "VS7": {"Operator": "GAURAVK", "Algo": 7},
-    "VS8": {"Operator": "ASHUTOSHM", "Algo": 102},
-    "VS9": {"Operator": "GULSHANS", "Algo": 7},
-    "VS19": {"Operator": "PRADYUMANS", "Algo": 15},
-    "NO SERVER": {"Operator": "A12/A18", "Algo": "12/18"},
-    "NOT RUNNING": {"Operator": "NOT RUNNING", "Algo": 0},
-    "CC_A1_GSPL6_DEALER": {"Operator": "GSPLDEALER", "Algo": 8},
-    "CC_GSPL_DEAL": {"Operator": "GSPLDEALER", "Algo": 8},
-    "DEALER_GSPL15": {"Operator": "GSPLDEALER", "Algo": 15},
-    "CC_SISL_GS_DEALER": {"Operator": "GSPLDEALER", "Algo": 8},
-    "GSPLDEALER": {"Operator": "GSPLDEALER", "Algo": 7},
-}
+# --- Removed hard-coded SERVER_ALGO_MAP. Mapping comes only from uploaded file. ---
 
 # Canonical column names
 CANONICAL_NAMES = {
@@ -177,8 +151,56 @@ def download_csv_as_df(service, file_id: str, skiprows: int = 6) -> pd.DataFrame
     fh.seek(0)
     return pd.read_csv(fh, skiprows=skiprows)
 
+# ====================== MAPPING (upload only; no defaults) ======================
+def read_server_mapping(upload) -> dict:
+    """
+    Requires an uploaded mapping file (.xlsx or .csv) with columns:
+    Server, Operator, Algo  (case-insensitive; extra columns ignored)
+    Returns: {Server: {"Operator": <str>, "Algo": <str|int>}}
+    """
+    if upload is None:
+        st.error("Please upload a ServerMapping file (.xlsx or .csv) with columns Server, Operator, Algo.")
+        st.stop()
+
+    name = upload.name.lower()
+    try:
+        if name.endswith(".csv"):
+            mdf = pd.read_csv(upload)
+        else:
+            mdf = pd.read_excel(upload)
+    except Exception as e:
+        st.error(f"Failed to read mapping file: {e}")
+        st.stop()
+
+    # Normalize headers
+    mdf.columns = [_norm_header(c) for c in mdf.columns]
+    lower = {c.lower(): c for c in mdf.columns}
+    required = {"server", "operator", "algo"}
+    if not required.issubset(lower.keys()):
+        st.error(f"Mapping must contain columns: Server, Operator, Algo. Found: {list(mdf.columns)}")
+        st.stop()
+
+    server_col = lower["server"]
+    operator_col = lower["operator"]
+    algo_col = lower["algo"]
+
+    # Build dict
+    mdf = mdf[[server_col, operator_col, algo_col]].copy()
+    mdf[server_col] = mdf[server_col].astype(str).str.strip()
+    mdf[operator_col] = mdf[operator_col].astype(str).str.strip()
+    mdf[algo_col] = mdf[algo_col].where(pd.notna(mdf[algo_col]), "")
+
+    mdf = mdf[mdf[server_col] != ""]
+    mapping = {}
+    for _, r in mdf.iterrows():
+        mapping[r[server_col]] = {"Operator": r[operator_col], "Algo": r[algo_col]}
+    if not mapping:
+        st.error("Mapping file produced an empty mapping. Please check contents.")
+        st.stop()
+    return mapping
+
 # ====================== COMPILER (Drive -> Excel) ======================
-def process_csv_files(service, files: List[dict], skiprows: int = 6) -> pd.DataFrame:
+def process_csv_files(service, files: List[dict], server_map: dict, skiprows: int = 6) -> pd.DataFrame:
     all_data = []
     for f in files:
         if not str(f.get("name", "")).lower().endswith(".csv"):
@@ -187,12 +209,13 @@ def process_csv_files(service, files: List[dict], skiprows: int = 6) -> pd.DataF
             df = download_csv_as_df(service, f["id"], skiprows=skiprows)
             df = normalize_columns(df)
 
-            server = str(f["name"]).split()[0]
-            algo_info = SERVER_ALGO_MAP.get(server, {"Operator": "", "Algo": ""})
+            server = str(f["name"]).split()[0].strip()
+            op = server_map.get(server, {}).get("Operator", "")
+            algo = server_map.get(server, {}).get("Algo", "")
 
             df["Server"] = server
-            df["Operator"] = algo_info["Operator"]
-            df["Algo"] = algo_info["Algo"]
+            df["Operator"] = op
+            df["Algo"] = algo
 
             df = ensure_columns(df, ["User Alias", "User ID", "Broker", "Max Loss",
                                      "Server", "Telegram ID(s)", "Algo", "Operator"])
@@ -320,7 +343,7 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
         maxloss_equal = pd.isna(a["_MaxLoss_num"]) and pd.isna(b["_MaxLoss_num"])
         if not maxloss_equal:
             if (pd.isna(a["_MaxLoss_num"]) != pd.isna(b["_MaxLoss_num"])) or \
-               (not pd.isna(a["_MaxLoss_num"]) and not pd.isna(b["_MaxLoss_num"]) and float(a["_MaxLoss_num"]) != float(b["_MaxLoss_num"])):
+               (not pd.isna(a["_MaxLoss_num"]) and not pd.isna(b["_MaxLoss_num"]) and float(a["_MaxLoss_num"]) != float(b["_MaxLoss_num"])) :
                 diffs.append("Max Loss")
         if str(a["Server"]) != str(b["Server"]):
             diffs.append("Server")
@@ -352,6 +375,17 @@ st.title(APP_TITLE)
 
 mode = st.sidebar.radio("Mode", ["Compile from Google Drive", "Compare Latest vs Last (Sheet1)"], index=0)
 
+with st.sidebar.expander("ServerMapping"):
+    mapping_file = st.file_uploader("Upload ServerMapping (.xlsx or .csv)", type=["xlsx", "csv"])
+    st.caption("Required columns: **Server, Operator, Algo** (case-insensitive).")
+    st.download_button(
+        "Download Mapping Template (CSV)",
+        data=pd.DataFrame({"Server": ["VS1","VS2"], "Operator": ["NAME","NAME"], "Algo": [8,1]}).to_csv(index=False).encode(),
+        file_name="ServerMapping_template.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 with st.sidebar.expander("Google Auth"):
     st.caption("If running locally with files, this deletes local token.json. (Secrets-based tokens are managed in Streamlit Cloud.)")
     if st.button("🔁 Reset local token.json"):
@@ -378,6 +412,9 @@ if mode == "Compile from Google Drive":
     run_compile = st.button("🚀 Compile Now", type="primary", use_container_width=True)
 
     if run_compile:
+        # Require mapping upload (no defaults, no persistence)
+        server_map = read_server_mapping(mapping_file)
+
         try:
             folder_id = extract_folder_id(link)
         except ValueError as e:
@@ -397,27 +434,9 @@ if mode == "Compile from Google Drive":
                 st.warning("No CSV files found in this folder.")
                 st.stop()
 
-            processed, all_df = [], []
-            progress = st.progress(0.0, text="Starting…")
-            for i, f in enumerate(csv_files, start=1):
-                try:
-                    df = download_csv_as_df(service, f["id"], skiprows=skiprows)
-                    df = normalize_columns(df)
-                    server = str(f["name"]).split()[0]
-                    algo_info = SERVER_ALGO_MAP.get(server, {"Operator": "", "Algo": ""})
-                    df["Server"] = server
-                    df["Operator"] = algo_info["Operator"]
-                    df["Algo"] = algo_info["Algo"]
-                    df = ensure_columns(df, ["User Alias", "User ID", "Broker", "Max Loss", "Server", "Telegram ID(s)", "Algo", "Operator"])
-                    mask = df["User Alias"].astype(str).str.contains("DEAL|FEED", case=False, na=False)
-                    df = df[~mask]
-                    all_df.append(df)
-                    processed.append(f["name"])
-                except Exception as e:
-                    st.warning(f"Skipping '{f['name']}': {e}")
-                progress.progress(i / max(1, len(csv_files)), text=f"Processed {i}/{len(csv_files)}")
+            with st.spinner("Downloading & processing…"):
+                compiled_df = process_csv_files(service, csv_files, server_map, skiprows=skiprows)
 
-            compiled_df = pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
             if compiled_df.empty:
                 st.error("No valid data after processing.")
                 st.stop()
@@ -435,7 +454,7 @@ if mode == "Compile from Google Drive":
                 "Specified_Compiled": specified,
                 "Summary": summary
             })
-            st.success(f"Built workbook from {len(processed)} CSV file(s).")
+            st.success(f"Built workbook from {len([f for f in csv_files])} CSV file(s).")
             st.download_button(
                 "⬇️ Download Compiled_User_Settings.xlsx",
                 data=xbytes,
@@ -451,7 +470,7 @@ if mode == "Compile from Google Drive":
                 st.dataframe(summary, use_container_width=True)
 
             with st.expander("Processed files"):
-                st.write("\n".join(processed))
+                st.write("\n".join([f["name"] for f in csv_files]))
 
         except FileNotFoundError as e:
             st.error(str(e))
