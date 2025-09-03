@@ -255,7 +255,7 @@ def clean_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     df["User ID"] = df["User ID"].astype(str)
     df["Server"] = df["Server"].astype(str)
     df["Algo"] = df["Algo"].astype(str)
-    df["Telegram ID(s)"] = df["Telegram ID(s)"].astype(str)
+    df["Telegram ID(s)"] = df["Telegram ID(s)"].astype(float)
 
     for c in ["Server", "Telegram ID(s)", "Algo"]:
         df[c] = df[c].fillna("")
@@ -545,3 +545,4 @@ else:
             st.exception(e)
     else:
         st.info("Upload both Excel files to start.")
+
