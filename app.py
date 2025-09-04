@@ -1,3 +1,14 @@
+# app.py  (Streamlit)
+# Title: User Settings — Compile from Drive & Compare
+# Features:
+# - Compile CSVs from a Google Drive folder (with Server→Operator/Algo mapping)
+# - Compare "Latest" (Specified_Compiled) vs "Last" (Sheet1) with filters on the Modified view
+# - Treat "Telegram ID(s)" and "Max Loss" as integers end-to-end (nullable Int64)
+#
+# How to run:
+#   pip install streamlit pandas openpyxl pillow google-api-python-client google-auth google-auth-oauthlib
+#   streamlit run app.py
+
 import os
 import io
 import re
@@ -18,8 +29,6 @@ APP_TITLE = "User Settings — Compile from Drive & Compare"
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 TOKEN_PATH = "token.json"
 CLIENT_SECRETS_FILE = "client_secrets.json"
-
-# --- Removed hard-coded SERVER_ALGO_MAP. Mapping comes only from uploaded file. ---
 
 # Canonical column names
 CANONICAL_NAMES = {
@@ -42,7 +51,7 @@ CANONICAL_NAMES = {
     "telegram id(s)": "Telegram ID(s)",
     "telegram ids": "Telegram ID(s)",
     "telegram id": "Telegram ID(s)",
-    "allocation": "Telegram ID(s)",  # mapping for Sheet1 -> Telegram ID(s)
+    "allocation": "Telegram ID(s)",  # for Sheet1 -> Telegram ID(s)
     "algo": "Algo",
     "operator": "Operator",
 }
@@ -50,6 +59,25 @@ SPECIFIED_ORDER = ["User Alias", "User ID", "Broker", "Max Loss", "Server", "Tel
 COMPARE_COLS = ["User ID", "Max Loss", "Server", "Telegram ID(s)", "Algo"]
 SHEET_TO_COMPARE = "Specified_Compiled"
 SHEET1_NAME = "Sheet1"  # the "last" workbook sheet to compare against
+
+# ====================== THEME / PAGE ======================
+st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
+st.markdown(
+    """
+    <style>
+      .app-title {font-size: 2rem; font-weight: 700; margin-bottom: .25rem;}
+      .app-subtle {color: #64748b; margin-bottom: 1rem;}
+      .stMetric {background: #fff; border-radius: 12px; padding: 8px 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06);}
+      .block-gap {margin-top: 12px; margin-bottom: 12px;}
+      .pill {display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;margin-right:6px;}
+      .bordered-container {border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#fff;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(f"<div class='app-title'>🧭 {APP_TITLE}</div>", unsafe_allow_html=True)
+st.markdown("<div class='app-subtle'>Compile operator/spec sheets from Google Drive and compare changes safely.</div>", unsafe_allow_html=True)
 
 # ====================== COMMON HELPERS ======================
 def _norm_header(s: str) -> str:
@@ -77,6 +105,18 @@ def ensure_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
             df[c] = ""
     return df
 
+def to_excel_bytes(sheet_map: dict) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for name, df in sheet_map.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    bio.seek(0)
+    return bio.read()
+
+def to_int(series: pd.Series) -> pd.Series:
+    """Convert to nullable integer (Int64) so blanks stay <NA>."""
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
+
 def extract_folder_id(link: str) -> str:
     link = link.strip()
     m = re.search(r"/folders/([A-Za-z0-9_\-]+)", link)
@@ -86,13 +126,8 @@ def extract_folder_id(link: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_\-]{20,}", link): return link
     raise ValueError("Could not extract folder id from the provided link/id.")
 
-def to_excel_bytes(sheet_map: dict) -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        for name, df in sheet_map.items():
-            df.to_excel(writer, sheet_name=name[:31], index=False)
-    bio.seek(0)
-    return bio.read()
+def _normalize_column_names(cols: List[str]) -> List[str]:
+    return [_norm_header(c) for c in cols]
 
 # ====================== DRIVE AUTH & IO ======================
 def authenticate_drive():
@@ -101,6 +136,10 @@ def authenticate_drive():
     1) Credentials from Streamlit Secrets -> [google_token] (token.json content)
     2) Local token.json + client_secrets.json (fallback for local dev)
     """
+    # Cache across reruns
+    if 'drive_service' in st.session_state:
+        return st.session_state['drive_service']
+
     # 1) Streamlit Secrets token (recommended on Streamlit Cloud)
     if "google_token" in st.secrets:
         token_info = dict(st.secrets["google_token"])
@@ -112,7 +151,9 @@ def authenticate_drive():
             else:
                 st.error("google_token has no refresh_token. Recreate token.json with offline access and update Secrets.")
                 st.stop()
-        return build('drive', 'v3', credentials=creds)
+        service = build('drive', 'v3', credentials=creds)
+        st.session_state['drive_service'] = service
+        return service
 
     # 2) Local files (fallback)
     creds = None
@@ -125,7 +166,9 @@ def authenticate_drive():
         creds = flow.run_local_server(port=0)
         with open(TOKEN_PATH, 'w') as token:
             token.write(creds.to_json())
-    return build('drive', 'v3', credentials=creds)
+    service = build('drive', 'v3', credentials=creds)
+    st.session_state['drive_service'] = service
+    return service
 
 def list_files_in_folder(service, folder_id: str) -> List[dict]:
     files, page_token = [], None
@@ -155,7 +198,7 @@ def download_csv_as_df(service, file_id: str, skiprows: int = 6) -> pd.DataFrame
 def read_server_mapping(upload) -> dict:
     """
     Requires an uploaded mapping file (.xlsx or .csv) with columns:
-    Server, Operator, Algo  (case-insensitive; extra columns ignored)
+    Server, Operator, Algo
     Returns: {Server: {"Operator": <str>, "Algo": <str|int>}}
     """
     if upload is None:
@@ -188,8 +231,7 @@ def read_server_mapping(upload) -> dict:
     mdf = mdf[[server_col, operator_col, algo_col]].copy()
     mdf[server_col] = mdf[server_col].astype(str).str.strip()
     mdf[operator_col] = mdf[operator_col].astype(str).str.strip()
-    mdf[algo_col] = mdf[algo_col].where(pd.notna(mdf[algo_col]), "")
-
+    # Algo may be int/string; keep as-is for display; don't coerce here.
     mdf = mdf[mdf[server_col] != ""]
     mapping = {}
     for _, r in mdf.iterrows():
@@ -215,10 +257,14 @@ def process_csv_files(service, files: List[dict], server_map: dict, skiprows: in
 
             df["Server"] = server
             df["Operator"] = op
-            df["Algo"] = algo
+            df["Algo"] = str(algo)
 
             df = ensure_columns(df, ["User Alias", "User ID", "Broker", "Max Loss",
                                      "Server", "Telegram ID(s)", "Algo", "Operator"])
+
+            # ✅ Force integers where required (nullable Int64)
+            df["Telegram ID(s)"] = to_int(df["Telegram ID(s)"])
+            df["Max Loss"]       = to_int(df["Max Loss"])
 
             # Drop DEAL / DEALER / FEED aliases
             mask = df["User Alias"].astype(str).str.contains("DEAL|FEED", case=False, na=False)
@@ -242,28 +288,24 @@ def generate_summary(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([summary, grand_total], ignore_index=True)
 
 # ====================== COMPARATOR (Excel -> diffs) ======================
-def _normalize_column_names(cols: List[str]) -> List[str]:
-    return [_norm_header(c) for c in cols]
-
 def clean_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = _normalize_column_names(df.columns)
     missing = [c for c in COMPARE_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Sheet '{SHEET_TO_COMPARE}' is missing columns: {missing}")
+
     df = df[COMPARE_COLS].copy()
 
+    # Types: keep key/labels as strings
     df["User ID"] = df["User ID"].astype(str)
-    df["Server"] = df["Server"].astype(str)
-    df["Algo"] = df["Algo"].astype(str)
-    df["Telegram ID(s)"] = df["Telegram ID(s)"].astype(int)
+    df["Server"]  = df["Server"].astype(str)
+    df["Algo"]    = df["Algo"].astype(str)
 
-    for c in ["Server", "Telegram ID(s)", "Algo"]:
-        df[c] = df[c].fillna("")
+    # ✅ Keep these as nullable integers
+    df["Telegram ID(s)"] = to_int(df["Telegram ID(s)"])
+    df["Max Loss"]       = to_int(df["Max Loss"])
 
-    numeric_max_loss = pd.to_numeric(df["Max Loss"], errors="coerce")
-    df["_MaxLoss_num"] = numeric_max_loss.fillna(pd.NA)
-    df["Max Loss"] = df["Max Loss"].apply(lambda x: "" if pd.isna(x) else str(x))
-
+    # Dedup on key
     df = df.sort_index().drop_duplicates(subset=["User ID"], keep="last").reset_index(drop=True)
     return df
 
@@ -301,14 +343,12 @@ def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
 
     out = pd.DataFrame({
         "User ID": df[col_user].astype(str),
-        "Max Loss": df[col_mloss],
+        "Max Loss": to_int(df[col_mloss]),            # ✅ int
         "Server": df[col_server].astype(str),
-        "Telegram ID(s)": df[col_alloc].astype(int),
+        "Telegram ID(s)": to_int(df[col_alloc]),      # ✅ int
         "Algo": df[col_algo].astype(str),
     })
-    # Reuse cleaning to align types and helper columns
-    out = clean_for_compare(out)
-    return out
+    return clean_for_compare(out)
 
 def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     last_idx = last_df.set_index("User ID")
@@ -329,35 +369,57 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
     ]
     rows = []
 
+    def fmt(v, integer=False):
+        if pd.isna(v):
+            return ""
+        return int(v) if integer else str(v)
+
+    def neq(x, y):
+        if pd.isna(x) and pd.isna(y):
+            return False
+        return x != y
+
     for uid in added_ids:
         r = latest_idx.loc[uid]
-        rows.append([uid, "ADDED", "", r["Max Loss"], "", r["Server"], "", r["Telegram ID(s)"], "", r["Algo"], "ALL"])
+        rows.append([
+            uid, "ADDED",
+            "", fmt(r["Max Loss"], integer=True),
+            "", fmt(r["Server"]),
+            "", fmt(r["Telegram ID(s)"], integer=True),
+            "", fmt(r["Algo"]),
+            "ALL"
+        ])
 
     for uid in removed_ids:
         r = last_idx.loc[uid]
-        rows.append([uid, "REMOVED", r["Max Loss"], "", r["Server"], "", r["Telegram ID(s)"], "", r["Algo"], "", "ALL"])
+        rows.append([
+            uid, "REMOVED",
+            fmt(r["Max Loss"], integer=True), "",
+            fmt(r["Server"]), "",
+            fmt(r["Telegram ID(s)"], integer=True), "",
+            fmt(r["Algo"]), "",
+            "ALL"
+        ])
 
     for uid in common_ids:
         a, b = last_idx.loc[uid], latest_idx.loc[uid]
         diffs = []
-        maxloss_equal = pd.isna(a["_MaxLoss_num"]) and pd.isna(b["_MaxLoss_num"])
-        if not maxloss_equal:
-            if (pd.isna(a["_MaxLoss_num"]) != pd.isna(b["_MaxLoss_num"])) or \
-               (not pd.isna(a["_MaxLoss_num"]) and not pd.isna(b["_MaxLoss_num"]) and float(a["_MaxLoss_num"]) != float(b["_MaxLoss_num"])) :
-                diffs.append("Max Loss")
-        if str(a["Server"]) != str(b["Server"]):
+        if neq(a["Max Loss"], b["Max Loss"]):
+            diffs.append("Max Loss")
+        if neq(a["Server"], b["Server"]):
             diffs.append("Server")
-        if int(a["Telegram ID(s)"]) != int(b["Telegram ID(s)"]):
+        if neq(a["Telegram ID(s)"], b["Telegram ID(s)"]):
             diffs.append("Telegram ID(s)")
-        if str(a["Algo"]) != str(b["Algo"]):
+        if neq(a["Algo"], b["Algo"]):
             diffs.append("Algo")
+
         if diffs:
             rows.append([
                 uid, "MODIFIED",
-                a["Max Loss"], b["Max Loss"],
-                a["Server"], b["Server"],
-                a["Telegram ID(s)"], b["Telegram ID(s)"],
-                a["Algo"], b["Algo"],
+                fmt(a["Max Loss"], integer=True), fmt(b["Max Loss"], integer=True),
+                fmt(a["Server"]), fmt(b["Server"]),
+                fmt(a["Telegram ID(s)"], integer=True), fmt(b["Telegram ID(s)"], integer=True),
+                fmt(a["Algo"]), fmt(b["Algo"]),
                 ", ".join(diffs),
             ])
 
@@ -369,10 +431,129 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
         all_diffs.reset_index(drop=True)
     )
 
-# ====================== STREAMLIT UI ======================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+# ====================== UI HELPERS ======================
+def render_modified_with_filters(modified_df: pd.DataFrame):
+    """Render the Modified tab with interactive filters and downloadable results."""
+    st.caption("Use filters to narrow down the Modified rows.")
 
+    if modified_df.empty:
+        st.info("No modified rows.")
+        return
+
+    # Build choices
+    # Diff Columns tokens
+    diff_tokens = sorted({t.strip()
+                          for s in modified_df["Diff Columns"].dropna().astype(str)
+                          for t in s.split(",") if t.strip()})
+    if not diff_tokens:
+        diff_tokens = ["Max Loss", "Server", "Telegram ID(s)", "Algo"]
+
+    # Servers & Algos (from both last/latest)
+    servers = sorted(set(modified_df["Server (Last)"].astype(str)) |
+                     set(modified_df["Server (Latest)"].astype(str)))
+    algos = sorted(set(modified_df["Algo (Last)"].astype(str)) |
+                   set(modified_df["Algo (Latest)"].astype(str)))
+
+    # Numeric bounds for Max Loss / Telegram IDs
+    # Convert to numeric safely (ignore blanks)
+    def _nan_to_series(col):
+        s = pd.to_numeric(modified_df[col], errors="coerce")
+        return s.dropna()
+
+    maxloss_last_vals = _nan_to_series("Max Loss (Last)")
+    maxloss_latest_vals = _nan_to_series("Max Loss (Latest)")
+    tel_last_vals = _nan_to_series("Telegram ID(s) (Last)")
+    tel_latest_vals = _nan_to_series("Telegram ID(s) (Latest)")
+
+    # UI
+    with st.expander("Filters", expanded=True):
+        fcol1, fcol2, fcol3 = st.columns([1.2, 1, 1])
+        with fcol1:
+            selected_tokens = st.multiselect("Changed columns include…", diff_tokens, default=diff_tokens)
+            user_query = st.text_input("User ID contains", value="")
+        with fcol2:
+            sel_servers = st.multiselect("Server (Last/Latest)", servers, default=servers)
+            sel_algos = st.multiselect("Algo (Last/Latest)", algos, default=algos)
+        with fcol3:
+            # Range sliders only if we have numeric data
+            if not maxloss_latest_vals.empty:
+                ml_min, ml_max = int(maxloss_latest_vals.min()), int(maxloss_latest_vals.max())
+            else:
+                ml_min, ml_max = 0, 0
+            ml_range = st.slider("Max Loss (Latest) range", min_value=int(ml_min), max_value=int(ml_max) if ml_max >= ml_min else int(ml_min), value=(int(ml_min), int(ml_max)) if ml_max>=ml_min else (int(ml_min), int(ml_min)))
+            if not tel_latest_vals.empty:
+                tl_min, tl_max = int(tel_latest_vals.min()), int(tel_latest_vals.max())
+            else:
+                tl_min, tl_max = 0, 0
+            tl_range = st.slider("Telegram ID(s) (Latest) range", min_value=int(tl_min), max_value=int(tl_max) if tl_max >= tl_min else int(tl_min), value=(int(tl_min), int(tl_max)) if tl_max>=tl_min else (int(tl_min), int(tl_min)))
+
+    # Apply filters
+    filt = modified_df.copy()
+
+    # Filter by tokens (Diff Columns contains any of selected)
+    if selected_tokens and len(selected_tokens) < len(diff_tokens):
+        mask = filt["Diff Columns"].apply(lambda s: any(tok in str(s) for tok in selected_tokens))
+        filt = filt[mask]
+
+    # Filter by user id search
+    if user_query.strip():
+        q = user_query.strip().lower()
+        filt = filt[filt["User ID"].astype(str).str.lower().str.contains(q)]
+
+    # Server filter (match either last/latest)
+    if sel_servers and len(sel_servers) < len(servers):
+        filt = filt[
+            filt["Server (Last)"].astype(str).isin(sel_servers) |
+            filt["Server (Latest)"].astype(str).isin(sel_servers)
+        ]
+
+    # Algo filter
+    if sel_algos and len(sel_algos) < len(algos):
+        filt = filt[
+            filt["Algo (Last)"].astype(str).isin(sel_algos) |
+            filt["Algo (Latest)"].astype(str).isin(sel_algos)
+        ]
+
+    # Max Loss (Latest) range
+    if not filt.empty and (ml_max >= ml_min):
+        ml_num = pd.to_numeric(filt["Max Loss (Latest)"], errors="coerce")
+        filt = filt[(ml_num.isna()) | ((ml_num >= ml_range[0]) & (ml_num <= ml_range[1]))]
+
+    # Telegram ID(s) (Latest) range
+    if not filt.empty and (tl_max >= tl_min):
+        tl_num = pd.to_numeric(filt["Telegram ID(s) (Latest)"], errors="coerce")
+        filt = filt[(tl_num.isna()) | ((tl_num >= tl_range[0]) & (tl_num <= tl_range[1]))]
+
+    # Small metrics row
+    m1, m2 = st.columns(2)
+    with m1: st.metric("Rows after filters", len(filt))
+    with m2: 
+        st.caption("Changed columns legend:")
+        st.markdown("".join([f"<span class='pill'>{t}</span>" for t in diff_tokens]), unsafe_allow_html=True)
+
+    st.dataframe(filt, use_container_width=True, height=480)
+
+    # Downloads
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        xbytes = to_excel_bytes({"Modified_Filtered": filt})
+        st.download_button(
+            "⬇️ Download filtered Modified (Excel)",
+            data=xbytes,
+            file_name="modified_filtered.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    with dl2:
+        st.download_button(
+            "⬇️ Download filtered Modified (CSV)",
+            data=filt.to_csv(index=False).encode(),
+            file_name="modified_filtered.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+# ====================== SIDEBAR ======================
 mode = st.sidebar.radio("Mode", ["Compile from Google Drive", "Compare Latest vs Last (Sheet1)"], index=0)
 
 with st.sidebar.expander("ServerMapping"):
@@ -398,18 +579,21 @@ with st.sidebar.expander("Google Auth"):
         except Exception as e:
             st.error(f"Could not delete token: {e}")
 
+# ====================== MODES ======================
+
 # -------- Mode 1: Compile from Drive --------
 if mode == "Compile from Google Drive":
-    st.subheader("Compile CSVs in a Drive folder into `Compiled_User_Settings.xlsx`")
+    st.subheader("📦 Compile CSVs in a Drive folder into `Compiled_User_Settings.xlsx`")
     link = st.text_input("Paste Google Drive folder link (or folder ID)")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns([1,1,1])
     with c1:
         skiprows = st.number_input("CSV header lines to skip before real header", min_value=0, max_value=50, value=6, step=1)
     with c2:
         out_name = st.text_input("Output filename", value="Compiled_User_Settings.xlsx")
-
-    run_compile = st.button("🚀 Compile Now", type="primary", use_container_width=True)
+    with c3:
+        st.markdown("<div class='block-gap'></div>", unsafe_allow_html=True)
+        run_compile = st.button("🚀 Compile Now", type="primary", use_container_width=True)
 
     if run_compile:
         # Require mapping upload (no defaults, no persistence)
@@ -455,6 +639,12 @@ if mode == "Compile from Google Drive":
                 "Summary": summary
             })
             st.success(f"Built workbook from {len([f for f in csv_files])} CSV file(s).")
+
+            m1, m2, m3 = st.columns(3)
+            with m1: st.metric("Rows compiled", f"{len(compiled_df):,}")
+            with m2: st.metric("Unique Users", compiled_df["User ID"].nunique())
+            with m3: st.metric("Servers", compiled_df["Server"].nunique())
+
             st.download_button(
                 "⬇️ Download Compiled_User_Settings.xlsx",
                 data=xbytes,
@@ -463,13 +653,12 @@ if mode == "Compile from Google Drive":
                 use_container_width=True
             )
 
-            with st.expander("Preview (first 10 rows)"):
-                st.write("**Specified_Compiled**")
-                st.dataframe(specified.head(10), use_container_width=True)
-                st.write("**Summary**")
+            tabs = st.tabs(["Specified_Compiled (preview)", "Summary", "Processed files"])
+            with tabs[0]:
+                st.dataframe(specified.head(25), use_container_width=True)
+            with tabs[1]:
                 st.dataframe(summary, use_container_width=True)
-
-            with st.expander("Processed files"):
+            with tabs[2]:
                 st.write("\n".join([f["name"] for f in csv_files]))
 
         except FileNotFoundError as e:
@@ -481,7 +670,7 @@ if mode == "Compile from Google Drive":
 
 # -------- Mode 2: Compare Latest vs Last (Sheet1) --------
 else:
-    st.subheader("Compare LATEST compiled (`Specified_Compiled`) vs LAST workbook (`Sheet1`)")
+    st.subheader("🔍 Compare LATEST compiled (`Specified_Compiled`) vs LAST workbook (`Sheet1`)")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -495,7 +684,7 @@ else:
 
         try:
             # Read & normalize
-            last_df   = read_sheet1_last(last_bytes)        # from Sheet1 schema
+            last_df   = read_sheet1_last(last_bytes)                # from Sheet1 schema
             latest_df = clean_for_compare(read_specified_compiled(latest_bytes))  # from Specified_Compiled
 
             st.success("Loaded: LAST from Sheet1, LATEST from Specified_Compiled.")
@@ -509,15 +698,15 @@ else:
             with k4: st.metric("Total Differences", len(all_diffs))
 
             st.markdown("---")
-            tabs = st.tabs(["All Differences", "Added", "Removed", "Modified"])
+            tabs = st.tabs(["All Differences", "Added", "Removed", "Modified (Filterable)"])
             with tabs[0]:
-                st.dataframe(all_diffs, use_container_width=True)
+                st.dataframe(all_diffs, use_container_width=True, height=480)
             with tabs[1]:
-                st.dataframe(added_df, use_container_width=True)
+                st.dataframe(added_df, use_container_width=True, height=480)
             with tabs[2]:
-                st.dataframe(removed_df, use_container_width=True)
+                st.dataframe(removed_df, use_container_width=True, height=480)
             with tabs[3]:
-                st.dataframe(modified_df, use_container_width=True)
+                render_modified_with_filters(modified_df)
 
             xbytes = to_excel_bytes({
                 "All_Differences": all_diffs,
@@ -533,11 +722,14 @@ else:
                 use_container_width=True
             )
 
-            with st.expander("Preview: Latest (Specified_Compiled) & Last (Sheet1) — first 10 rows"):
-                st.write("**Latest (cleaned)**")
-                st.dataframe(latest_df.head(10), use_container_width=True)
-                st.write("**Last (cleaned)**")
-                st.dataframe(last_df.head(10), use_container_width=True)
+            with st.expander("Preview (first 10 rows)"):
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.write("**Latest (cleaned)**")
+                    st.dataframe(latest_df.head(10), use_container_width=True)
+                with cc2:
+                    st.write("**Last (cleaned)**")
+                    st.dataframe(last_df.head(10), use_container_width=True)
 
         except ValueError as ve:
             st.error(str(ve))
@@ -545,6 +737,3 @@ else:
             st.exception(e)
     else:
         st.info("Upload both Excel files to start.")
-
-
-
