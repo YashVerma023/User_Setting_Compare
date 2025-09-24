@@ -1,14 +1,3 @@
-# app.py  (Streamlit)
-# Title: User Settings — Compile from Drive & Compare
-# Features:
-# - Compile CSVs from a Google Drive folder (with Server→Operator/Algo mapping)
-# - Compare "Latest" (Specified_Compiled) vs "Last" (Sheet1) with filters on the Modified view
-# - Treat "Telegram ID(s)" and "Max Loss" as integers end-to-end (nullable Int64)
-#
-# How to run:
-#   pip install streamlit pandas openpyxl pillow google-api-python-client google-auth google-auth-oauthlib
-#   streamlit run app.py
-
 import os
 import io
 import re
@@ -23,6 +12,14 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
+
+# Accept either "Sheet1" or "Users" (any case, with/without trailing spaces)
+SHEET1_CANDIDATES = ["Sheet1", "Users"]
+
+def _norm_sheet_name(name: str) -> str:
+    # Trim spaces and compare case-insensitively
+    return _norm_header(name).strip().lower()
+
 
 # ============================ CONFIG ============================
 APP_TITLE = "User Settings — Compile from Drive & Compare"
@@ -314,18 +311,38 @@ def read_specified_compiled(xlsx_bytes: bytes) -> pd.DataFrame:
 
 def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
     """
-    Read 'Sheet1' from the LAST workbook and map its columns to the comparison schema:
+    Read the 'last' workbook sheet which can be any of:
+      Sheet1 / Users (case-insensitive; trailing spaces allowed)
+    Map its columns to the comparison schema:
       UserID -> User ID (key)
       ALLOCATION -> Telegram ID(s)
-      MAX LOSS -> Max Loss
+      MAX LOSS / Max_Loss / etc. -> Max Loss
       SERVER -> Server
       ALGO -> Algo
     """
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET1_NAME, engine="openpyxl")
-    # normalize headers (keep original cases for data, we'll map by lower)
+    # 1) Pick the correct sheet name from candidates
+    xls = pd.ExcelFile(io.BytesIO(xlsx_bytes), engine="openpyxl")
+    normalized_to_real = {_norm_sheet_name(s): s for s in xls.sheet_names}
+
+    selected_norms = {_norm_sheet_name(s) for s in SHEET1_CANDIDATES}
+    selected_real = None
+    for norm, real in normalized_to_real.items():
+        if norm in selected_norms:
+            selected_real = real
+            break
+
+    if not selected_real:
+        raise ValueError(
+            f"Could not find a sheet named any of {SHEET1_CANDIDATES} "
+            f"(case-insensitive; spaces ignored). Found sheets: {xls.sheet_names}"
+        )
+
+    # 2) Read the selected sheet
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=selected_real, engine="openpyxl")
+
+    # normalize headers (keep original cases for data; map by lower)
     norm_map = {c: _norm_header(c) for c in df.columns}
     df.rename(columns=norm_map, inplace=True)
-
     lower_to_real = { _norm_header(c).lower(): c for c in df.columns }
 
     def pick(*names):
@@ -333,22 +350,24 @@ def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
             key = _norm_header(n).lower()
             if key in lower_to_real:
                 return lower_to_real[key]
-        raise ValueError(f"Missing column in {SHEET1_NAME}: one of {names}")
+        raise ValueError(f"Missing column in '{selected_real}': one of {names}")
 
     col_user   = pick("UserID", "User ID", "userid", "user_id")
     col_alloc  = pick("ALLOCATION", "Telegram ID(s)", "Telegram IDs", "Telegram ID")
-    col_mloss  = pick("MAX LOSS", "Max Loss", "maxloss")
+    # ⬇️ Expanded variants for Max Loss (underscore & case variants)
+    col_mloss  = pick("MAX LOSS", "Max Loss", "maxloss", "MAX_LOSS", "Max_Loss", "max_loss")
     col_server = pick("SERVER", "Server")
     col_algo   = pick("ALGO", "Algo")
 
     out = pd.DataFrame({
         "User ID": df[col_user].astype(str),
-        "Max Loss": to_int(df[col_mloss]),            # ✅ int
+        "Max Loss": to_int(df[col_mloss]),            # ✅ nullable Int64
         "Server": df[col_server].astype(str),
-        "Telegram ID(s)": to_int(df[col_alloc]),      # ✅ int
+        "Telegram ID(s)": to_int(df[col_alloc]),      # ✅ nullable Int64
         "Algo": df[col_algo].astype(str),
     })
     return clean_for_compare(out)
+
 
 def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     last_idx = last_df.set_index("User ID")
