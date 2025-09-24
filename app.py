@@ -13,19 +13,14 @@ from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 
-# Accept either "Sheet1" or "Users" (any case, with/without trailing spaces)
-SHEET1_CANDIDATES = ["Sheet1", "Users"]
-
-def _norm_sheet_name(name: str) -> str:
-    # Trim spaces and compare case-insensitively
-    return _norm_header(name).strip().lower()
-
-
 # ============================ CONFIG ============================
 APP_TITLE = "User Settings — Compile from Drive & Compare"
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 TOKEN_PATH = "token.json"
 CLIENT_SECRETS_FILE = "client_secrets.json"
+
+# Accept either "Sheet1" or "Users" (any case, with/without trailing spaces)
+SHEET1_CANDIDATES = ["Sheet1", "Users"]
 
 # Canonical column names
 CANONICAL_NAMES = {
@@ -55,7 +50,7 @@ CANONICAL_NAMES = {
 SPECIFIED_ORDER = ["User Alias", "User ID", "Broker", "Max Loss", "Server", "Telegram ID(s)", "Algo"]
 COMPARE_COLS = ["User ID", "Max Loss", "Server", "Telegram ID(s)", "Algo"]
 SHEET_TO_COMPARE = "Specified_Compiled"
-SHEET1_NAME = "Sheet1"  # the "last" workbook sheet to compare against
+SHEET1_NAME = "Sheet1"  # legacy default (we now also accept Users)
 
 # ====================== THEME / PAGE ======================
 st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
@@ -80,6 +75,9 @@ st.markdown("<div class='app-subtle'>Compile operator/spec sheets from Google Dr
 def _norm_header(s: str) -> str:
     s = str(s).replace("\n", " ").replace("\r", " ")
     return " ".join(s.split()).strip()
+
+def _norm_sheet_name(name: str) -> str:
+    return _norm_header(name).strip().lower()
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
@@ -125,6 +123,19 @@ def extract_folder_id(link: str) -> str:
 
 def _normalize_column_names(cols: List[str]) -> List[str]:
     return [_norm_header(c) for c in cols]
+
+def build_alias_map(df: pd.DataFrame) -> dict:
+    """
+    Returns {User ID (str) -> User_Alias (str)} if both columns are present after normalization.
+    """
+    tmp = normalize_columns(df.copy())
+    if "User ID" not in tmp.columns or "User Alias" not in tmp.columns:
+        return {}
+    m = tmp[["User ID", "User Alias"]].copy()
+    m["User ID"] = m["User ID"].astype(str)
+    m["User Alias"] = m["User Alias"].astype(str)
+    m = m.sort_index().drop_duplicates(subset=["User ID"], keep="last")
+    return dict(zip(m["User ID"], m["User Alias"]))
 
 # ====================== DRIVE AUTH & IO ======================
 def authenticate_drive():
@@ -309,40 +320,39 @@ def clean_for_compare(df: pd.DataFrame) -> pd.DataFrame:
 def read_specified_compiled(xlsx_bytes: bytes) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_TO_COMPARE, engine="openpyxl")
 
-def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
+def read_sheet1_last(xlsx_bytes: bytes) -> Tuple[pd.DataFrame, dict]:
     """
-    Read the 'last' workbook sheet which can be any of:
+    Read the 'last' workbook sheet which can be:
       Sheet1 / Users (case-insensitive; trailing spaces allowed)
-    Map its columns to the comparison schema:
-      UserID -> User ID (key)
+
+    Map columns to compare schema:
+      UserID -> User ID
       ALLOCATION -> Telegram ID(s)
-      MAX LOSS / Max_Loss / etc. -> Max Loss
+      MAX LOSS / Max_Loss / ... -> Max Loss
       SERVER -> Server
       ALGO -> Algo
+
+    Also returns an alias map {User ID -> User_Alias} from the last workbook (if present).
     """
-    # 1) Pick the correct sheet name from candidates
+    # 1) Choose the correct sheet
     xls = pd.ExcelFile(io.BytesIO(xlsx_bytes), engine="openpyxl")
     normalized_to_real = {_norm_sheet_name(s): s for s in xls.sheet_names}
-
-    selected_norms = {_norm_sheet_name(s) for s in SHEET1_CANDIDATES}
+    wanted = {_norm_sheet_name(s) for s in SHEET1_CANDIDATES}
     selected_real = None
     for norm, real in normalized_to_real.items():
-        if norm in selected_norms:
+        if norm in wanted:
             selected_real = real
             break
-
     if not selected_real:
         raise ValueError(
             f"Could not find a sheet named any of {SHEET1_CANDIDATES} "
             f"(case-insensitive; spaces ignored). Found sheets: {xls.sheet_names}"
         )
 
-    # 2) Read the selected sheet
+    # 2) Read and normalize headers (also canonicalize with your mapping)
     df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=selected_real, engine="openpyxl")
-
-    # normalize headers (keep original cases for data; map by lower)
-    norm_map = {c: _norm_header(c) for c in df.columns}
-    df.rename(columns=norm_map, inplace=True)
+    df = normalize_columns(df)
+    df.rename(columns={c: _norm_header(c) for c in df.columns}, inplace=True)
     lower_to_real = { _norm_header(c).lower(): c for c in df.columns }
 
     def pick(*names):
@@ -354,22 +364,44 @@ def read_sheet1_last(xlsx_bytes: bytes) -> pd.DataFrame:
 
     col_user   = pick("UserID", "User ID", "userid", "user_id")
     col_alloc  = pick("ALLOCATION", "Telegram ID(s)", "Telegram IDs", "Telegram ID")
-    # ⬇️ Expanded variants for Max Loss (underscore & case variants)
     col_mloss  = pick("MAX LOSS", "Max Loss", "maxloss", "MAX_LOSS", "Max_Loss", "max_loss")
     col_server = pick("SERVER", "Server")
     col_algo   = pick("ALGO", "Algo")
 
+    # 3) Build compare frame
     out = pd.DataFrame({
         "User ID": df[col_user].astype(str),
-        "Max Loss": to_int(df[col_mloss]),            # ✅ nullable Int64
+        "Max Loss": to_int(df[col_mloss]),
         "Server": df[col_server].astype(str),
-        "Telegram ID(s)": to_int(df[col_alloc]),      # ✅ nullable Int64
+        "Telegram ID(s)": to_int(df[col_alloc]),
         "Algo": df[col_algo].astype(str),
     })
-    return clean_for_compare(out)
+    out = clean_for_compare(out)
 
+    # 4) Build alias map from *last* workbook (if present)
+    last_alias_map = {}
+    if "User Alias" in df.columns:
+        am = df[[col_user, "User Alias"]].copy()
+        am[col_user] = am[col_user].astype(str)
+        am["User Alias"] = am["User Alias"].astype(str)
+        am = am.sort_index().drop_duplicates(subset=[col_user], keep="last")
+        last_alias_map = dict(zip(am[col_user], am["User Alias"]))
 
-def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return out, last_alias_map
+
+def compare_frames(
+    last_df: pd.DataFrame,
+    latest_df: pd.DataFrame,
+    last_alias: dict = None,
+    latest_alias: dict = None
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns: (added_df, removed_df, modified_df, all_diffs)
+    with an extra 'User_Alias' column filled from last_alias if available, else latest_alias.
+    """
+    last_alias = last_alias or {}
+    latest_alias = latest_alias or {}
+
     last_idx = last_df.set_index("User ID")
     latest_idx = latest_df.set_index("User ID")
     last_ids, latest_ids = set(last_idx.index), set(latest_idx.index)
@@ -379,7 +411,7 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
     common_ids = sorted(list(latest_ids & last_ids))
 
     cols_out = [
-        "User ID", "Change Type",
+        "User ID", "User_Alias", "Change Type",
         "Max Loss (Last)", "Max Loss (Latest)",
         "Server (Last)", "Server (Latest)",
         "Telegram ID(s) (Last)", "Telegram ID(s) (Latest)",
@@ -398,10 +430,20 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
             return False
         return x != y
 
+    def get_alias(uid: str) -> str:
+        # Prefer alias from LAST if present; otherwise fall back to LATEST; else blank.
+        v = last_alias.get(uid, None)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+        v = latest_alias.get(uid, None)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+        return ""
+
     for uid in added_ids:
         r = latest_idx.loc[uid]
         rows.append([
-            uid, "ADDED",
+            uid, get_alias(uid), "ADDED",
             "", fmt(r["Max Loss"], integer=True),
             "", fmt(r["Server"]),
             "", fmt(r["Telegram ID(s)"], integer=True),
@@ -412,7 +454,7 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
     for uid in removed_ids:
         r = last_idx.loc[uid]
         rows.append([
-            uid, "REMOVED",
+            uid, get_alias(uid), "REMOVED",
             fmt(r["Max Loss"], integer=True), "",
             fmt(r["Server"]), "",
             fmt(r["Telegram ID(s)"], integer=True), "",
@@ -423,18 +465,14 @@ def compare_frames(last_df: pd.DataFrame, latest_df: pd.DataFrame) -> Tuple[pd.D
     for uid in common_ids:
         a, b = last_idx.loc[uid], latest_idx.loc[uid]
         diffs = []
-        if neq(a["Max Loss"], b["Max Loss"]):
-            diffs.append("Max Loss")
-        if neq(a["Server"], b["Server"]):
-            diffs.append("Server")
-        if neq(a["Telegram ID(s)"], b["Telegram ID(s)"]):
-            diffs.append("Telegram ID(s)")
-        if neq(a["Algo"], b["Algo"]):
-            diffs.append("Algo")
+        if neq(a["Max Loss"], b["Max Loss"]): diffs.append("Max Loss")
+        if neq(a["Server"], b["Server"]): diffs.append("Server")
+        if neq(a["Telegram ID(s)"], b["Telegram ID(s)"]): diffs.append("Telegram ID(s)")
+        if neq(a["Algo"], b["Algo"]): diffs.append("Algo")
 
         if diffs:
             rows.append([
-                uid, "MODIFIED",
+                uid, get_alias(uid), "MODIFIED",
                 fmt(a["Max Loss"], integer=True), fmt(b["Max Loss"], integer=True),
                 fmt(a["Server"]), fmt(b["Server"]),
                 fmt(a["Telegram ID(s)"], integer=True), fmt(b["Telegram ID(s)"], integer=True),
@@ -460,7 +498,6 @@ def render_modified_with_filters(modified_df: pd.DataFrame):
         return
 
     # Build choices
-    # Diff Columns tokens
     diff_tokens = sorted({t.strip()
                           for s in modified_df["Diff Columns"].dropna().astype(str)
                           for t in s.split(",") if t.strip()})
@@ -474,7 +511,6 @@ def render_modified_with_filters(modified_df: pd.DataFrame):
                    set(modified_df["Algo (Latest)"].astype(str)))
 
     # Numeric bounds for Max Loss / Telegram IDs
-    # Convert to numeric safely (ignore blanks)
     def _nan_to_series(col):
         s = pd.to_numeric(modified_df[col], errors="coerce")
         return s.dropna()
@@ -494,65 +530,66 @@ def render_modified_with_filters(modified_df: pd.DataFrame):
             sel_servers = st.multiselect("Server (Last/Latest)", servers, default=servers)
             sel_algos = st.multiselect("Algo (Last/Latest)", algos, default=algos)
         with fcol3:
-            # Range sliders only if we have numeric data
             if not maxloss_latest_vals.empty:
                 ml_min, ml_max = int(maxloss_latest_vals.min()), int(maxloss_latest_vals.max())
             else:
                 ml_min, ml_max = 0, 0
-            ml_range = st.slider("Max Loss (Latest) range", min_value=int(ml_min), max_value=int(ml_max) if ml_max >= ml_min else int(ml_min), value=(int(ml_min), int(ml_max)) if ml_max>=ml_min else (int(ml_min), int(ml_min)))
+            ml_range = st.slider(
+                "Max Loss (Latest) range",
+                min_value=int(ml_min),
+                max_value=int(ml_max) if ml_max >= ml_min else int(ml_min),
+                value=(int(ml_min), int(ml_max)) if ml_max >= ml_min else (int(ml_min), int(ml_min))
+            )
             if not tel_latest_vals.empty:
                 tl_min, tl_max = int(tel_latest_vals.min()), int(tel_latest_vals.max())
             else:
                 tl_min, tl_max = 0, 0
-            tl_range = st.slider("Telegram ID(s) (Latest) range", min_value=int(tl_min), max_value=int(tl_max) if tl_max >= tl_min else int(tl_min), value=(int(tl_min), int(tl_max)) if tl_max>=tl_min else (int(tl_min), int(tl_min)))
+            tl_range = st.slider(
+                "Telegram ID(s) (Latest) range",
+                min_value=int(tl_min),
+                max_value=int(tl_max) if tl_max >= tl_min else int(tl_min),
+                value=(int(tl_min), int(tl_max)) if tl_max >= tl_min else (int(tl_min), int(tl_min))
+            )
 
     # Apply filters
     filt = modified_df.copy()
 
-    # Filter by tokens (Diff Columns contains any of selected)
     if selected_tokens and len(selected_tokens) < len(diff_tokens):
         mask = filt["Diff Columns"].apply(lambda s: any(tok in str(s) for tok in selected_tokens))
         filt = filt[mask]
 
-    # Filter by user id search
     if user_query.strip():
         q = user_query.strip().lower()
         filt = filt[filt["User ID"].astype(str).str.lower().str.contains(q)]
 
-    # Server filter (match either last/latest)
     if sel_servers and len(sel_servers) < len(servers):
         filt = filt[
             filt["Server (Last)"].astype(str).isin(sel_servers) |
             filt["Server (Latest)"].astype(str).isin(sel_servers)
         ]
 
-    # Algo filter
     if sel_algos and len(sel_algos) < len(algos):
         filt = filt[
             filt["Algo (Last)"].astype(str).isin(sel_algos) |
             filt["Algo (Latest)"].astype(str).isin(sel_algos)
         ]
 
-    # Max Loss (Latest) range
     if not filt.empty and (ml_max >= ml_min):
         ml_num = pd.to_numeric(filt["Max Loss (Latest)"], errors="coerce")
         filt = filt[(ml_num.isna()) | ((ml_num >= ml_range[0]) & (ml_num <= ml_range[1]))]
 
-    # Telegram ID(s) (Latest) range
     if not filt.empty and (tl_max >= tl_min):
         tl_num = pd.to_numeric(filt["Telegram ID(s) (Latest)"], errors="coerce")
         filt = filt[(tl_num.isna()) | ((tl_num >= tl_range[0]) & (tl_num <= tl_range[1]))]
 
-    # Small metrics row
     m1, m2 = st.columns(2)
     with m1: st.metric("Rows after filters", len(filt))
-    with m2: 
+    with m2:
         st.caption("Changed columns legend:")
         st.markdown("".join([f"<span class='pill'>{t}</span>" for t in diff_tokens]), unsafe_allow_html=True)
 
     st.dataframe(filt, use_container_width=True, height=480)
 
-    # Downloads
     dl1, dl2 = st.columns(2)
     with dl1:
         xbytes = to_excel_bytes({"Modified_Filtered": filt})
@@ -689,13 +726,13 @@ if mode == "Compile from Google Drive":
 
 # -------- Mode 2: Compare Latest vs Last (Sheet1) --------
 else:
-    st.subheader("🔍 Compare LATEST compiled (`Specified_Compiled`) vs LAST workbook (`Sheet1`)")
+    st.subheader("🔍 Compare LATEST compiled (`Specified_Compiled`) vs LAST workbook (`Sheet1`/`Users`)")
 
     col1, col2 = st.columns(2)
     with col1:
-        f_last = st.file_uploader("Upload **Last Workbook** (.xlsx) — must contain Sheet1", type=["xlsx"], key="last_file")
+        f_last = st.file_uploader("Upload **Last Workbook** (.xlsx) — contains `Sheet1` or `Users`", type=["xlsx"], key="last_file")
     with col2:
-        f_latest = st.file_uploader("Upload **Latest Compiled** (.xlsx) — uses Specified_Compiled", type=["xlsx"], key="latest_file")
+        f_latest = st.file_uploader("Upload **Latest Compiled** (.xlsx) — uses `Specified_Compiled`", type=["xlsx"], key="latest_file")
 
     if f_last and f_latest:
         last_bytes = f_last.read()
@@ -703,21 +740,47 @@ else:
 
         try:
             # Read & normalize
-            last_df   = read_sheet1_last(last_bytes)                # from Sheet1 schema
-            latest_df = clean_for_compare(read_specified_compiled(latest_bytes))  # from Specified_Compiled
+            last_df, last_alias = read_sheet1_last(last_bytes)          # from Sheet1/Users schema (+ alias map)
+            latest_raw = read_specified_compiled(latest_bytes)          # Specified_Compiled as-is
+            latest_alias = build_alias_map(latest_raw)                  # {User ID -> User_Alias}
+            latest_df = clean_for_compare(latest_raw)                   # only compare fields
 
-            st.success("Loaded: LAST from Sheet1, LATEST from Specified_Compiled.")
+            st.success("Loaded: LAST from Sheet1/Users, LATEST from Specified_Compiled.")
 
-            added_df, removed_df, modified_df, all_diffs = compare_frames(last_df, latest_df)
+            added_df, removed_df, modified_df, all_diffs = compare_frames(last_df, latest_df, last_alias, latest_alias)
 
-            k1, k2, k3, k4 = st.columns(4)
+            # --- Derived categories: Differences in MS / CC based on User_Alias prefixes ---
+            def filter_by_alias_prefixes(df: pd.DataFrame, prefixes: List[str]) -> pd.DataFrame:
+                if df.empty:
+                    return df
+                p = tuple(prefixes)
+                mask = df["User_Alias"].astype(str).str.strip().str.upper().str.startswith(p)
+                return df[mask].reset_index(drop=True)
+
+            ms_prefixes = ["MSR", "MSP", "MSS", "MSN"]
+            cc_prefixes = ["CC", "CCV", "CCG", "MSG", "MSV"]
+
+            diffs_ms_df = filter_by_alias_prefixes(all_diffs, ms_prefixes)
+            diffs_cc_df = filter_by_alias_prefixes(all_diffs, cc_prefixes)
+
+            # Metrics
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
             with k1: st.metric("Added", len(added_df))
             with k2: st.metric("Removed", len(removed_df))
             with k3: st.metric("Modified", len(modified_df))
-            with k4: st.metric("Total Differences", len(all_diffs))
+            with k4: st.metric("All Differences", len(all_diffs))
+            with k5: st.metric("Differences in MS", len(diffs_ms_df))
+            with k6: st.metric("Differences in CC", len(diffs_cc_df))
 
             st.markdown("---")
-            tabs = st.tabs(["All Differences", "Added", "Removed", "Modified (Filterable)"])
+            tabs = st.tabs([
+                "All Differences",
+                "Added",
+                "Removed",
+                "Modified (Filterable)",
+                "Differences in MS",
+                "Differences in CC"
+            ])
             with tabs[0]:
                 st.dataframe(all_diffs, use_container_width=True, height=480)
             with tabs[1]:
@@ -726,12 +789,21 @@ else:
                 st.dataframe(removed_df, use_container_width=True, height=480)
             with tabs[3]:
                 render_modified_with_filters(modified_df)
+            with tabs[4]:
+                st.caption("Aliases starting with: MSR, MSP, MSS, MSN")
+                st.dataframe(diffs_ms_df, use_container_width=True, height=480)
+            with tabs[5]:
+                st.caption("Aliases starting with: CC, CCV, CCG, MSG, MSV")
+                st.dataframe(diffs_cc_df, use_container_width=True, height=480)
 
+            # Export
             xbytes = to_excel_bytes({
                 "All_Differences": all_diffs,
                 "Added": added_df,
                 "Removed": removed_df,
-                "Modified": modified_df
+                "Modified": modified_df,
+                "Differences_in_MS": diffs_ms_df,
+                "Differences_in_CC": diffs_cc_df
             })
             st.download_button(
                 "⬇️ Download Differences (Excel)",
@@ -744,10 +816,10 @@ else:
             with st.expander("Preview (first 10 rows)"):
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    st.write("**Latest (cleaned)**")
+                    st.write("**Latest (cleaned for compare)**")
                     st.dataframe(latest_df.head(10), use_container_width=True)
                 with cc2:
-                    st.write("**Last (cleaned)**")
+                    st.write("**Last (cleaned for compare)**")
                     st.dataframe(last_df.head(10), use_container_width=True)
 
         except ValueError as ve:
